@@ -1,0 +1,31 @@
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+yarn-debug.log
+.pnpm-debug.log
+
+# Ambiente
+.env
+.clang-format
+
+# Build
+dist/
+build/
+config/constants.h
+config/cert.pem
+config/key.pem
+
+# IDE
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+utils/canDecoder.js

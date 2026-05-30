@@ -1,0 +1,421 @@
+#include <ESP32-TWAI-CAN.hpp>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <map>
+
+// ------------------------------------------------------------------
+// --- CONFIGURAÇÃO DE PINOS E VELOCIDADE ---
+// ------------------------------------------------------------------
+#define CAN_TX_PIN 5 // GPIO 5 (TXD)
+#define CAN_RX_PIN 4 // GPIO 4 (RXD)
+
+// CORRIGIDO 1: A biblioteca exige o tipo 'TwaiSpeed' e suas constantes
+// internas. Usamos TwaiSpeed e a constante para 250kbps.
+const TwaiSpeed CAN_SPEED = TWAI_SPEED_250KBPS;
+
+// Estrutura nativa para frames (a única que funciona com readFrame)
+twai_message_t rxFrame;
+
+// ============== CONFIGURAÇÕES WIFI ==============
+String ssid = "CINGUESTS";
+String password = "acessocin";
+// =============== Link do server ===================
+String url =
+    "https://344de5dd1dc5-10-244-13-100-32633.saci.r.killercoda.com/api";
+// ============== Estrutura de dados CAN ==============
+struct CanMessage {
+  String id;
+  int dlc;
+  String data;
+};
+
+// =======================================================
+// === ESTRUTURA DE CACHE COM ÁRVORE DE BUSCA (std::map) ===
+// =======================================================
+// Chave: ID CAN (uint32_t)
+// Valor: Payload (String)
+std::map<String, String> canCacheMap;
+
+// Auxiliar para contagem de repetições
+int sendCount = 0;
+// Tamanho máximo do buffer de mensagens CAN
+const int CAN_BUFFER_SIZE = 11;     // Fila suporta até 11 mensagens
+const int CAN_BUFFER_AUX_SIZE = 10; // Fila suporta até 10 mensagens para enviar
+const int SEND_THRESHOLD = 10;      // Enviar a cada 10 mensagens
+const int CAN_SIMULATION_INTERVAL_MS = 1000; // 1 Hz
+const int INTERVAL_1000MS = 1000;            // 1 Hz
+const int INTERVAL_100MS = 100;              // 10 Hz
+const int INTERVAL_10MS = 10;                // 100 Hz
+const int INTERVAL_1MS = 1;                  // 1000 Hz
+// ============== Variáveis compartilhadas ==============
+CanMessage buffer[10];    // Buffer Para envio e leitura
+CanMessage bufferAux[10]; // Buffer Auxiliar
+
+QueueHandle_t canQueue;        // Fila para armazenar mensagens CAN
+SemaphoreHandle_t canMutex;    // Protege o acesso à variável buffer
+SemaphoreHandle_t bufferReady; // Sinaliza buffer Pronto para envio
+
+int messageCount = 0; // Contador de mensagens CAN recebidas
+uint32_t count = 0;   // Contador de mensagens na fila
+
+// ============== Protótipo da Task ==============
+void telemetriaTask(void *parameter);
+void canReaderTask(void *parameter);
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial)
+    delay(10);
+
+  // Limpeza garantida do cache
+  canCacheMap.clear();
+  // Cria uma fila (buffer) para armazenar mensagens CAN
+  canQueue = xQueueCreate(CAN_BUFFER_SIZE, sizeof(CanMessage));
+  if (canQueue == NULL) {
+    Serial.println("❌ Falha ao criar fila CAN");
+    while (1)
+      delay(10);
+  }
+  // Inicializa mutex para proteger o acesso ao dado CAN
+  canMutex = xSemaphoreCreateMutex();
+  if (canMutex == NULL) {
+    Serial.println("❌ Falha ao criar mutex para CAN");
+    while (1)
+      delay(10);
+  }
+  // Cria semáforo de sinalização
+  bufferReady = xSemaphoreCreateBinary();
+  if (bufferReady == NULL) {
+    Serial.println("❌ Falha ao criar semáforo de buffer cheio");
+    while (1)
+      delay(10);
+  }
+  // Cria a task CAN no NÚCLEO 0
+  xTaskCreatePinnedToCore(canReaderTask, "CAN_Reader", 2048, NULL,
+                          2, // Prioridade maior que telemetria
+                          NULL,
+                          0 // Núcleo 0
+  );
+
+  // Cria a tarefa de telemetria no núcleo 1
+  xTaskCreatePinnedToCore(telemetriaTask,   // Função da tarefa
+                          "TelemetriaTask", // Nome amigável
+                          10000, // Tamanho da pilha (grande para HTTP)
+                          NULL,  // Parâmetros
+                          1,     // Prioridade
+                          NULL,  // Handle (não usado)
+                          1      // Núcleo 1 (deixe o núcleo 0 livre)
+  );
+
+  // Serial.println("--- Leitor/Sniffer CAN ESP32 (TJA1050) - Versão Final
+  // ---");
+
+  // 1. Configura os pinos antes de iniciar o driver CAN
+  ESP32Can.setPins(CAN_TX_PIN, CAN_RX_PIN);
+
+  // 2. Inicializa o controlador CAN. Agora passa a constante TwaiSpeed.
+  if (ESP32Can.begin(CAN_SPEED)) {
+    Serial.println("Controlador CAN (TWAI) iniciado com sucesso!");
+    // Serial.println("Monitorando em 250 kbps nos pinos TX:5 e RX:4...");
+  } else {
+    Serial.println(
+        "ERRO: Falha ao iniciar o controlador CAN! Verifique as conexões.");
+    while (1)
+      delay(100);
+  }
+}
+
+// ------------------------------------------------------------------
+// --- LOOP PRINCIPAL (LEITURA DE DADOS) ---
+// ------------------------------------------------------------------
+void loop() { delay(1); }
+
+void canReaderTask(void *parameter) {
+  (void)parameter;
+  int messageCounter = 0;
+  String data_string = "";
+
+  for (;;) {
+
+    if (ESP32Can.readFrame(&rxFrame)) {
+
+      // Serial.println("---------------------------------------------");
+      // Serial.println("PACOTE RECEBIDO:");
+
+      // 1. ID da Mensagem
+      // Serial.print("  ID: 0x");
+
+      // CORRIGIDO 2: Acessa o bit EXT_FLAG (0x01) na union flags para verificar
+      // ID Estendido Esta é a forma correta para o driver TWAI.
+      if (rxFrame.flags & TWAI_MSG_FLAG_EXTD) {
+        // Serial.print(rxFrame.identifier, HEX);
+        // Serial.print(" (Estendido)");
+      } else {
+        // Serial.print(rxFrame.identifier, HEX);
+        // Serial.print(" (Padrão)");
+      }
+
+      // 2. Comprimento dos Dados (DLC)
+      // Serial.print(", DLC: ");
+      // Serial.println(rxFrame.data_length_code); // Este membro já estava
+      // correto
+
+      // 3. Dados (Payload)
+      // Serial.print("  Dados (HEX): ");
+
+      data_string = "";
+      // Usa 'data_length_code' para limitar o loop de dados.
+      for (int i = 0; i < rxFrame.data_length_code; i++) {
+        byte dataByte = rxFrame.data[i];
+
+        // === CRÍTICO: FORMATAÇÃO EM HEX DE 2 DÍGITOS ===
+        if (dataByte < 0x10) {
+          data_string += "0";
+        }
+        data_string +=
+            String(dataByte, HEX); // Garante formato "0A" ao invés de "A"
+
+        // Se NÃO for o último elemento (i < 7), adiciona um espaço.
+        if (i < (rxFrame.data_length_code - 1)) {
+          data_string += " ";
+        }
+
+        /*
+        // Formata a saída para 2 dígitos em HEX
+        if (dataByte < 0x10)
+          Serial.print("0");
+        Serial.print(dataByte, HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+
+      */
+      }
+      CanMessage newMsg = {.id = String(rxFrame.identifier),
+                           .dlc = rxFrame.data_length_code,
+                           .data = data_string};
+
+      // -----------------------------------------------------------------
+      // --- CHAMADA PARA A FUNÇÃO DE VERIFICAÇÃO ---
+      // -----------------------------------------------------------------
+      if (!isDataChangedAndCache(newMsg.id, newMsg.data)) {
+        // Se a função retornar FALSE, o dado não mudou. Descarta e continua.
+        // Serial.printf("😴 CAN ID 0x%X sem alteração.
+        // Descartando.\n",rxFrame.identifier);
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+        continue;
+      }
+
+      // Tenta adicionar na fila (não bloqueante)
+      if (xQueueSendToBack(canQueue, &newMsg,
+                           INTERVAL_100MS / portTICK_PERIOD_MS) != pdTRUE) {
+        Serial.println("⚠️ Buffer CAN cheio! Mensagem perdida.");
+      } else {
+        count = uxQueueMessagesWaiting(canQueue);
+        // Se atingiu 1000, sinaliza
+        if (count == SEND_THRESHOLD) {
+          Serial.printf(
+              "🔔 %d mensagens armazenadas! Avisando para enviar...\n", count);
+          int sentCount = 0;
+
+          // Protege a escrita com mutex
+          if (xSemaphoreTake(canMutex, INTERVAL_1MS / portTICK_PERIOD_MS)) {
+            // Lê até 10 mensagens da fila → elas são REMOVIDAS
+            // automaticamente
+            while (sentCount < SEND_THRESHOLD &&
+                   xQueueReceive(canQueue, &newMsg, 0) == pdTRUE) {
+              buffer[sentCount++] = newMsg;
+            }
+            // Sinaliza que há 10 mensagens para enviar
+            xSemaphoreGive(bufferReady);
+            xSemaphoreGive(canMutex);
+          }
+        }
+        Serial.printf("%d 📨 CAN armazenado: ID=%s DLC=%d Data=%s\n", count,
+                      newMsg.id.c_str(), newMsg.dlc, newMsg.data.c_str());
+      }
+    }
+  }
+}
+
+// ============== TASK 2: Envio de Telemetria ==============
+void telemetriaTask(void *parameter) {
+  (void)parameter; // Ignora parâmetro não usado
+  Serial.println("Conectando ao Wi-Fi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("✅ Conectado ao Wi-Fi!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  unsigned long lastSend = 0;
+  for (;;) { // Loop infinito da tarefa
+    unsigned long currentMillis = millis();
+    if (xSemaphoreTake(bufferReady, INTERVAL_10MS / portTICK_PERIOD_MS) ==
+        pdTRUE) {
+      Serial.println("🚀 Sinal recebido! Enviando 10 mensagens...");
+      // Protege a escrita com mutex
+      if (xSemaphoreTake(canMutex, INTERVAL_10MS / portTICK_PERIOD_MS)) {
+        for (int i = 0; i < SEND_THRESHOLD; i++) {
+          bufferAux[i] = buffer[i];
+        }
+        xSemaphoreGive(canMutex);
+      }
+      // Verifica conexão Wi-Fi
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("❌ Wi-Fi desconectado. Tentando reconectar...");
+        WiFi.reconnect();
+        delay(2000);
+        if (WiFi.status() != WL_CONNECTED) {
+          continue;
+        }
+      }
+      HTTPClient http;
+      http.setTimeout(10000); // Timeout de 10 segundos
+      // Tenta iniciar conexão
+      if (!http.begin(url)) {
+        Serial.println("❌ Falha ao iniciar HTTP. URL inválida?");
+        continue;
+      }
+
+      http.addHeader("Content-Type", "application/json");
+
+      String jsonData = "{";
+      jsonData += "\"speed\": 48,";
+      jsonData += "\"battery\": {\"soc\": 76, \"soh\": 94, \"voltage\": 71.8, "
+                  "\"current\": -3.4, \"temperature\": 31.2},";
+      jsonData += "\"motor\": {\"rpm\": 3600, \"power\": 9.8, \"regenLevel\": "
+                  "40, \"motorTemp\": 68, \"inverterTemp\": 61},";
+      jsonData += "\"location\": {\"type\": \"Point\", \"coordinates\": "
+                  "[-45.6333, -23.5500]},";
+      jsonData += "\"driveMode\": \"sport\",";
+      jsonData += "\"range\": 74,";
+      jsonData += "\"vehicleStatus\": \"ligado\",";
+      jsonData += "\"odometer\": 1247.3,";
+      jsonData += "\"alerts\": [{";
+      jsonData += "  \"code\": \"MOTOR_OVERHEAT_WARNING\",";
+      jsonData += "  \"message\": \"Temperatura do motor acima de 65°C\",";
+      jsonData += "  \"severity\": \"warning\"";
+      jsonData += "}],";
+      jsonData += "\"canMessages\": [";
+
+      for (int i = 0; i < SEND_THRESHOLD; i++) {
+        jsonData += "{";
+        jsonData += "\"canId\": \"" + bufferAux[i].id + "\",";
+        jsonData += "\"data\": \"" + bufferAux[i].data + "\",";
+        jsonData +=
+            "\"dlc\": " + String(bufferAux[i].dlc); // ✅ Sem vírgula aqui
+        jsonData += "}";                            // Fecha o objeto
+
+        if (i < SEND_THRESHOLD - 1) {
+          jsonData += ","; // ✅ Vírgula entre objetos do array
+        }
+      }
+      jsonData += "]"; // Fecha o array canMessages
+      jsonData += "}"; // Fecha o JSON principal
+      sendCount++;
+      Serial.printf("%d  📤 Enviando telemetria...\n", sendCount);
+      int httpResponseCode = http.POST(jsonData);
+
+      if (httpResponseCode > 0) {
+        switch (httpResponseCode) {
+        case 200:
+        case 201:
+        case 204:
+          Serial.printf("✅ Sucesso! Código HTTP: %d\n", httpResponseCode);
+          break;
+
+        case 400:
+          Serial.println(
+              "❌ Requisição inválida. JSON mal formado ou campos faltando.");
+          break;
+
+        case 401:
+        case 403:
+          Serial.println(
+              "🔐 Falha de autenticação. Verifique token ou API key.");
+          break;
+
+        case 404:
+          Serial.println("🔍 Endpoint não encontrado. Verifique a URL.");
+          break;
+
+        case 413:
+          Serial.println("📦 Payload muito grande. Envie em lotes menores.");
+          break;
+
+        case 429:
+          Serial.println("⏳ Muitas requisições. Aumente o intervalo.");
+          break;
+
+        default:
+          if (httpResponseCode >= 400 && httpResponseCode < 500) {
+            Serial.printf("❌ Erro do cliente: %d\n", httpResponseCode);
+          } else if (httpResponseCode >= 500) {
+            Serial.printf(
+                "🔧 Erro do servidor: %d. Tente novamente mais tarde.\n",
+                httpResponseCode);
+          } else {
+            Serial.printf("⚠️  Resposta inesperada: %d\n", httpResponseCode);
+          }
+          break;
+        }
+      } else {
+        Serial.printf("❌ Falha na requisição. Código: %d\n", httpResponseCode);
+      }
+      http.end(); // Sempre encerre a conexão
+    }
+    // ⏱️ Libera o núcleo por 10ms (evita travar o FreeRTOS)
+    vTaskDelay(INTERVAL_10MS / portTICK_PERIOD_MS);
+  }
+}
+
+/**
+ * @brief Verifica se os dados são diferentes da última vez usando std::map.
+ * Se forem, atualiza o cache (insert ou update).
+ * * @param canIdString O identificador da mensagem CAN no formato String.
+ * @param newData A string de dados recém-formatada em HEX de largura fixa.
+ * @return true se os dados mudaram (ou se for um novo ID), false se os dados
+ * são iguais.
+ */
+bool isDataChangedAndCache(const String &canIdString, const String &newData) { // <-- ID agora é String
+    
+    // 1. Busca: Tenta encontrar o ID (String) no mapa
+    auto it = canCacheMap.find(canIdString); // Busca pela String
+
+    // ===================================================
+    // === ID ENCONTRADO (Mensagem já existe no cache) ===
+    // ===================================================
+    if (it != canCacheMap.end()) {
+        
+        // 2. Comparação
+        if (it->second == newData) {
+            return false; // DADOS SÃO IGUAIS. Descartar.
+        }
+        
+        // 3. Atualização (Dados mudaram)
+        it->second = newData; // Atualiza a string do payload no cache
+        Serial.printf("✨ ID %s atualizado.\n", canIdString.c_str());
+        return true; // DADOS MUDARAM. Enviar.
+
+    } 
+    
+    // ===================================================
+    // === ID NÃO ENCONTRADO (Mensagem é nova) ===
+    // ===================================================
+    else {
+        
+        // 4. Inserção: Adiciona o novo ID e o dado
+        canCacheMap[canIdString] = newData;
+        
+        // O log aparecerá AQUI. Adicionado +1 pois o size ainda não foi atualizado.
+        Serial.printf("✨ NOVO ID %s adicionado à árvore de busca (%d entradas).\n", 
+            canIdString.c_str(), canCacheMap.size());
+            
+        return true; // É novo. Enviar.
+    }
+}
